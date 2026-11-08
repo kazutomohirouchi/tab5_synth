@@ -1,22 +1,21 @@
 // ============================================================
-//  tab5_synth - M5Tab5 + Unit Synth シンセサイザー
+//  tab5_synth v2.0 - M5Tab5 + Unit Synth タッチシンセサイザー
 // ------------------------------------------------------------
-//  M5Stack Tab5 に Unit Synth (U178 / SAM2695) をつないだ、
-//  4小節ループ型のタッチシンセサイザー。
+//  M5Stack Tab5 に Unit Synth (U178 / SAM2695) を接続して使う、
+//  ループ型のタッチシンセサイザー。作者: かずとも/KAZUTOMO
 //
-//  モード:
-//    RHYTHM : ドラムパッド (10種) の重ね録り + ステップグリッド編集
-//    MELODY : 61鍵タッチキーボード (マルチタッチ/グリッサンド)
-//             + GM128音色選択 + ピアノロール式グリッド編集
-//    EDIT   : テンポ/音量/音長などの仕上げ調整と全体再生
-//  共通: 生tick録音 + 非破壊クォンタイズ、SDへ標準MIDIファイル出力
+//  ・RHYTHM: ドラムパッド10種 + ステップグリッド編集、重ね録り
+//  ・MELODY: 61鍵タッチキーボード (マルチタッチ/和音)、GM128音色、
+//            ピアノロール式グリッド編集 (ドラッグで音の長さ変更可)
+//  ・EDIT/PLAY: テンポ、音量、音長、ループ小節数 (4/8/12/16) の調整
+//  ・非破壊クォンタイズ (録音は生tick、再生/書き出し時に適用)
+//  ・SD へ標準MIDIファイルを連番で書き出し (上書きなし)、
+//    書き出したMIDIの読み込み (LOAD) にも対応
 //
-//  接続: Tab5 の HY2.0-4P (PORT.A) へ Grove ケーブルで Unit Synth。
-//        Unit Synth は受信専用 (黄線 = UART_RX) なので TX = G53。
-//
-//  必要ライブラリ: M5Unified / M5GFX / M5Unit-Synth
-//  ボード: M5Stack ボードパッケージの M5Tab5
-//  ライセンス: MIT (同梱の LICENSE を参照)
+//  配線: Tab5 の HY2.0-4P (PORT.A) に接続、TX = G53
+//  ビルド: Arduino IDE、ボード M5Tab5、要 M5Unified / M5GFX /
+//          M5Unit-Synth ライブラリ。詳細は README.md を参照。
+//  ライセンス: MIT (LICENSE ファイル参照)
 // ============================================================
 
 #include <M5Unified.h>
@@ -38,8 +37,8 @@ static const uint8_t DRUM_CH   = 9;
 
 static const uint32_t PPQ = 480;                 // 4分音符あたりの tick 数
 static int g_bpm = 120;
-static const int LOOP_BARS = 4;
-static const uint32_t LOOP_TICKS = LOOP_BARS * 4 * PPQ;  // 7680
+static int g_loopBars = 4;  // ループの小節数 (EDIT で 4/8/12/16)
+static inline uint32_t loopTicks(void) { return (uint32_t)g_loopBars * 4 * PPQ; }
 
 // ---------------- 編集パラメータ (Phase 4) ----------------
 // いずれも録音データには触れず、再生/書き出し時にだけ効く倍率系。
@@ -134,7 +133,7 @@ static uint32_t applyQuantize(uint32_t tick) {
 // グリッド表示用: 生tick → 一番近い16分ステップ (0..63)
 static int nearestStep16(uint32_t tick) {
   int s = (int)((tick + PPQ / 8) / (PPQ / 4));
-  return s % (LOOP_BARS * 16);
+  return s % (g_loopBars * 16);
 }
 
 // ---------------- モード / トランスポート状態 ----------------
@@ -160,7 +159,7 @@ static uint32_t posTickRaw(void) {
 }
 // トランスポート開始からの絶対 tick (キーを離した時刻の計算用)
 static uint32_t absNowTick(void) {
-  return g_passCount * LOOP_TICKS + posTickRaw();
+  return g_passCount * loopTicks() + posTickRaw();
 }
 
 // ---------------- イベント列の構築 ----------------
@@ -174,13 +173,14 @@ static std::vector<RawEv> buildChannelEvents(uint8_t ch, int repeats) {
   std::vector<RawEv> evs;
   int trackPct = (ch == MELODY_CH) ? g_melVolPct : g_drumVolPct;
   for (int rep = 0; rep < repeats; ++rep) {
-    uint32_t off = (uint32_t)rep * LOOP_TICKS;
+    uint32_t off = (uint32_t)rep * loopTicks();
     if (ch == MELODY_CH && rep == 0) evs.push_back({0, (uint8_t)(0xC0 | ch), g_melodyProgram, 0});
     if (ch == MELODY_CH && rep > 0)  evs.push_back({off, (uint8_t)(0xC0 | ch), g_melodyProgram, 0});
     if (trackPct == 0) continue;  // トラックミュート
     for (const Note& n : g_song) {
       if (n.ch != ch) continue;
       uint32_t sLoop = applyQuantize(n.start);
+      if (sLoop >= loopTicks()) continue;  // 現在のループ範囲外の音は鳴らさない
       uint32_t s = sLoop + off;
       // 編集パラメータ: 音量 (全体 x トラックのベロシティ倍率)
       int vel = (int)n.vel * g_masterVolPct * trackPct / 10000;
@@ -191,7 +191,7 @@ static std::vector<RawEv> buildChannelEvents(uint8_t ch, int repeats) {
       if (ch == MELODY_CH) {
         dur = dur * (uint32_t)g_gatePct / 100;
         if (dur < 10) dur = 10;
-        uint32_t maxDur = LOOP_TICKS - sLoop;
+        uint32_t maxDur = loopTicks() - sLoop;
         if (dur > maxDur) dur = maxDur;
       }
       evs.push_back({s, (uint8_t)(0x90 | ch), n.note, (uint8_t)vel});
@@ -278,9 +278,22 @@ static void buildTrack(std::vector<uint8_t>& out, const std::vector<RawEv>& evs,
   out.insert(out.end(), data.begin(), data.end());
 }
 
+static String g_exportName = "/tab5song.mid";  // 直近の書き出し先
+
 static int exportMidiFile(void) {
   if (!initSD()) return -1;
-  uint32_t end = LOOP_TICKS * g_repeats;
+  // 上書きしない: tab5song.mid, tab5song2.mid, ... の空き番号を使う
+  String name = "/tab5song.mid";
+  if (g_fs->exists("/tab5song.mid")) {
+    name = "";
+    for (int n = 2; n <= 99; ++n) {
+      String cand = "/tab5song" + String(n) + ".mid";
+      if (!g_fs->exists(cand.c_str())) { name = cand; break; }
+    }
+    if (name.length() == 0) return -3;  // 99 まで埋まっている
+  }
+  g_exportName = name;
+  uint32_t end = loopTicks() * g_repeats;
   std::vector<uint8_t> file;
   file.insert(file.end(), {'M', 'T', 'h', 'd'});
   put32(file, 6);
@@ -291,11 +304,157 @@ static int exportMidiFile(void) {
   buildTrack(file, buildChannelEvents(MELODY_CH, g_repeats), end, false);
   buildTrack(file, buildChannelEvents(DRUM_CH, g_repeats), end, false);
 
-  File f = g_fs->open("/tab5song.mid", "w");
+  File f = g_fs->open(name.c_str(), "w");
   if (!f) return -2;
   size_t written = f.write(file.data(), file.size());
   f.close();
   return (int)written;
+}
+
+// ---- SMF 読み込み: 書き出した /tab5song.mid を曲データに戻す ----
+// 戻り値: 0=成功, -1=SDなし, -2=ファイルなし, -3=形式エラー, -4=音なし
+// 曲は4小節ループのモデルなので、先頭1ループ分だけを取り込む。
+// テンポ (メタイベント) とメロディ音色 (プログラムチェンジ) も復元する。
+static int g_loadPos = 0;  // LOAD で次に読むファイルの順番 (番号順に循環)
+
+static int pickLoadFile(String& out) {
+  if (!initSD()) return -1;
+  std::vector<String> files;
+  if (g_fs->exists("/tab5song.mid")) files.push_back("/tab5song.mid");
+  for (int n = 2; n <= 99; ++n) {
+    String cand = "/tab5song" + String(n) + ".mid";
+    if (g_fs->exists(cand.c_str())) files.push_back(cand);
+  }
+  if (files.empty()) return -2;
+  int idx = g_loadPos % (int)files.size();
+  g_loadPos = idx + 1;
+  out = files[idx];
+  return 0;
+}
+
+static int loadMidiFile(const char* path) {
+  if (!initSD()) return -1;
+  File f = g_fs->open(path, "r");
+  if (!f) return -2;
+  size_t fsize = f.size();
+  if (fsize < 14 || fsize > 4 * 1024 * 1024) { f.close(); return -3; }
+  std::vector<uint8_t> b(fsize);
+  size_t rd = f.read(b.data(), fsize);
+  f.close();
+  if (rd != fsize) return -3;
+  auto rd16 = [&](size_t p) -> uint32_t { return (uint32_t)((b[p] << 8) | b[p + 1]); };
+  auto rd32 = [&](size_t p) -> uint32_t {
+    return ((uint32_t)b[p] << 24) | ((uint32_t)b[p + 1] << 16) |
+           ((uint32_t)b[p + 2] << 8) | (uint32_t)b[p + 3];
+  };
+  if (memcmp(b.data(), "MThd", 4) != 0) return -3;
+  uint32_t hlen = rd32(4);
+  if (hlen < 6 || 8 + hlen > fsize) return -3;
+  int ntrk = (int)rd16(10);
+  uint32_t division = rd16(12);
+  if (division & 0x8000) return -3;  // SMPTE 形式は非対応
+  if (division == 0) return -3;
+  auto scale = [&](uint32_t t) -> uint32_t {  // ファイルの tick → PPQ480 の tick
+    return (uint32_t)(((uint64_t)t * PPQ) / division);
+  };
+
+  std::vector<Note> loaded;
+  int tempoBpm = -1;
+  bool progFound = false;
+  // static 必須: [16][128] の int32+uint8 は約10KBあり、ローカル配列にすると
+  // loop タスクのスタック (8KB) を溢れてリブートする (Phase 7 初版の不具合)
+  static int32_t pendTick[16][128];  // ノートオン保持: 開始 tick (スケール済み), -1=なし
+  static uint8_t pendVel[16][128];
+  for (int c = 0; c < 16; ++c)
+    for (int n = 0; n < 128; ++n) pendTick[c][n] = -1;
+
+  size_t pos = 8 + hlen;
+  for (int tr = 0; tr < ntrk; ++tr) {
+    if (pos + 8 > fsize || memcmp(b.data() + pos, "MTrk", 4) != 0) return -3;
+    uint32_t tlen = rd32(pos + 4);
+    size_t tp = pos + 8;
+    size_t tend = tp + tlen;
+    if (tend > fsize) tend = fsize;
+    uint32_t absTick = 0;
+    uint8_t runStatus = 0;
+    while (tp < tend) {
+      uint32_t delta = 0; int guard = 0;
+      while (tp < tend && guard++ < 5) {
+        uint8_t c = b[tp++];
+        delta = (delta << 7) | (c & 0x7F);
+        if (!(c & 0x80)) break;
+      }
+      absTick += delta;
+      if (tp >= tend) break;
+      uint8_t st = b[tp];
+      if (st & 0x80) { runStatus = st; tp++; }
+      else st = runStatus;
+      if (st == 0xFF) {  // メタイベント
+        if (tp >= tend) return -3;
+        uint8_t type = b[tp++];
+        uint32_t len = 0; guard = 0;
+        while (tp < tend && guard++ < 5) {
+          uint8_t c = b[tp++];
+          len = (len << 7) | (c & 0x7F);
+          if (!(c & 0x80)) break;
+        }
+        if (type == 0x51 && len == 3 && tp + 3 <= tend) {
+          uint32_t mpq = ((uint32_t)b[tp] << 16) | ((uint32_t)b[tp + 1] << 8) | b[tp + 2];
+          if (mpq > 0 && tempoBpm < 0) tempoBpm = (int)(60000000UL / mpq);
+        }
+        tp += len;
+        runStatus = 0;
+      } else if (st == 0xF0 || st == 0xF7) {  // SysEx: スキップ
+        uint32_t len = 0; guard = 0;
+        while (tp < tend && guard++ < 5) {
+          uint8_t c = b[tp++];
+          len = (len << 7) | (c & 0x7F);
+          if (!(c & 0x80)) break;
+        }
+        tp += len;
+        runStatus = 0;
+      } else if ((st & 0xF0) >= 0x80 && (st & 0xF0) <= 0xE0) {
+        int ch = st & 0x0F;
+        int hi = st & 0xF0;
+        int ndata = (hi == 0xC0 || hi == 0xD0) ? 1 : 2;
+        if (tp + ndata > tend) return -3;
+        uint8_t d1 = b[tp], d2 = (ndata > 1) ? b[tp + 1] : 0;
+        tp += ndata;
+        uint32_t now = scale(absTick);
+        if (hi == 0x90 && d2 > 0) {  // ノートオン
+          if (ch == MELODY_CH || ch == DRUM_CH) {
+            pendTick[ch][d1 & 0x7F] = (int32_t)now;
+            pendVel[ch][d1 & 0x7F] = d2;
+          }
+        } else if (hi == 0x80 || (hi == 0x90 && d2 == 0)) {  // ノートオフ
+          if ((ch == MELODY_CH || ch == DRUM_CH) && pendTick[ch][d1 & 0x7F] >= 0) {
+            uint32_t start = (uint32_t)pendTick[ch][d1 & 0x7F];
+            uint8_t vel = pendVel[ch][d1 & 0x7F];
+            pendTick[ch][d1 & 0x7F] = -1;
+            if (start < loopTicks()) {
+              uint32_t dur = (now > start) ? now - start : 1;
+              if (ch == DRUM_CH) dur = 60;
+              if (start + dur > loopTicks()) dur = loopTicks() - start;
+              loaded.push_back({start, dur, (uint8_t)ch, (uint8_t)(d1 & 0x7F), vel});
+            }
+          }
+        } else if (hi == 0xC0 && ch == MELODY_CH && !progFound) {
+          g_melodyProgram = d1 & 0x7F;
+          progFound = true;
+        }
+      } else {
+        return -3;  // 未知のイベント
+      }
+    }
+    pos = tend;
+  }
+  if (loaded.empty()) return -4;
+  std::stable_sort(loaded.begin(), loaded.end(),
+                   [](const Note& a, const Note& c) { return a.start < c.start; });
+  stopTransport();
+  g_song = loaded;
+  if (tempoBpm >= 60 && tempoBpm <= 200) g_bpm = tempoBpm;
+  return 0;
 }
 
 // ---------------- ドラム定義 ----------------
@@ -351,7 +510,7 @@ static void drawFooter(void) {
   int drums = 0, mels = 0;
   for (const Note& n : g_song) (n.ch == DRUM_CH ? drums : mels)++;
   M5.Display.printf("notes: drum %d / melody %d   BPM %d   loop %d bars   SD:%s",
-                    drums, mels, g_bpm, LOOP_BARS, g_sdMode);
+                    drums, mels, g_bpm, g_loopBars, g_sdMode);
   M5.Display.setCursor(20, 682);
   M5.Display.print(g_msg);
 }
@@ -379,15 +538,16 @@ static void drawGridHeader(void) {
   M5.Display.setTextSize(3);
   M5.Display.setCursor(20, 424);
   M5.Display.printf("STEP: %s", DRUM_NAMES[g_selDrum]);
-  for (int b = 0; b < 4; ++b) {
-    int x = 330 + b * 76;
-    uint16_t col = (b == g_gridBar) ? TFT_BLUE : TFT_DARKGREY;
-    M5.Display.fillRect(x, 416, 66, 48, col);
-    M5.Display.drawRect(x, 416, 66, 48, TFT_WHITE);
-    M5.Display.setTextColor(TFT_WHITE, col);
-    M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString(String(b + 1), x + 33, 440);
-  }
+  M5.Display.fillRect(330, 416, 56, 48, TFT_DARKGREY);
+  M5.Display.drawRect(330, 416, 56, 48, TFT_WHITE);
+  M5.Display.fillRect(556, 416, 56, 48, TFT_DARKGREY);
+  M5.Display.drawRect(556, 416, 56, 48, TFT_WHITE);
+  M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString("<", 358, 440);
+  M5.Display.drawString(">", 584, 440);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.drawString(String(g_gridBar + 1) + " / " + String(g_loopBars), 471, 440);
   M5.Display.fillRect(660, 416, 180, 48, TFT_DARKGREY);
   M5.Display.drawRect(660, 416, 180, 48, TFT_WHITE);
   M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
@@ -610,6 +770,14 @@ static const char* NOTE_NAMES12[12] = {"C", "C#", "D", "D#", "E", "F",
                                        "F#", "G", "G#", "A", "A#", "B"};
 static int g_lastMelStepShown = -1;
 
+// グリッドの伸ばし (Phase 6): タップかドラッグかは離すまで分からないので、
+// 押した瞬間は保留だけして、毎フレーム handleMelGridDrag() が判定する。
+static int g_gridPendId = -1;       // 保留中のグリッドタッチの ID (-1=なし)
+static int g_gridPendPitch = -1;    // 押したセルの音高
+static int g_gridPendStep = -1;     // 押したセルの絶対ステップ 0..63
+static int g_gridPendIdx = -1;      // 伸ばし対象の g_song インデックス (-1=空セル)
+static bool g_gridStretching = false;  // 横へ動いて伸ばし中
+
 static void fitGridWindow(void) {
   int mn = 128, mx = -1;
   for (const Note& n : g_song) {
@@ -639,16 +807,18 @@ static int gridCellState(int pitch, int absStep) {
 
 static void drawMelGridHeader(void) {
   M5.Display.fillRect(0, GRID_HDR_Y, 1280, 44, TFT_BLACK);
-  for (int b = 0; b < 4; ++b) {
-    int x = GRID_CELL_X + b * 68;
-    uint16_t col = (b == g_gridBar) ? TFT_BLUE : TFT_DARKGREY;
-    M5.Display.fillRect(x, GRID_HDR_Y, 60, 44, col);
-    M5.Display.drawRect(x, GRID_HDR_Y, 60, 44, TFT_WHITE);
-    M5.Display.setTextColor(TFT_WHITE, col);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextDatum(middle_center);
-    M5.Display.drawString(String(b + 1), x + 30, GRID_HDR_Y + 22);
-  }
+  M5.Display.fillRect(GRID_CELL_X, GRID_HDR_Y, 48, 44, TFT_DARKGREY);
+  M5.Display.drawRect(GRID_CELL_X, GRID_HDR_Y, 48, 44, TFT_WHITE);
+  M5.Display.fillRect(GRID_CELL_X + 196, GRID_HDR_Y, 48, 44, TFT_DARKGREY);
+  M5.Display.drawRect(GRID_CELL_X + 196, GRID_HDR_Y, 48, 44, TFT_WHITE);
+  M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString("<", GRID_CELL_X + 24, GRID_HDR_Y + 22);
+  M5.Display.drawString(">", GRID_CELL_X + 220, GRID_HDR_Y + 22);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.drawString(String(g_gridBar + 1) + " / " + String(g_loopBars),
+                        GRID_CELL_X + 122, GRID_HDR_Y + 22);
   M5.Display.fillRect(420, GRID_HDR_Y, 170, 44, TFT_DARKGREY);
   M5.Display.drawRect(420, GRID_HDR_Y, 170, 44, TFT_WHITE);
   M5.Display.fillRect(610, GRID_HDR_Y, 70, 44, TFT_DARKGREY);
@@ -724,11 +894,104 @@ static void toggleMelStep(int pitch, int absStep) {
   if (!removed) {
     uint32_t start = (uint32_t)absStep * (PPQ / 4);
     uint32_t dur = GRID_LENS[g_gridLenIdx];
-    if (start + dur > LOOP_TICKS) dur = LOOP_TICKS - start;
+    if (start + dur > loopTicks()) dur = loopTicks() - start;
     g_song.push_back({start, dur, MELODY_CH, (uint8_t)pitch, 110});
     synth.setNoteOn(MELODY_CH, (uint8_t)pitch, 110);  // 試聴
     g_audNote = pitch;
     g_audOffAt = millis() + 150;
+  }
+}
+
+// その音高/ステップにかかるメロディ音の g_song インデックス (-1=なし)
+static int findMelNoteAt(int pitch, int absStep) {
+  for (size_t i = 0; i < g_song.size(); ++i) {
+    const Note& n = g_song[i];
+    if (n.ch != MELODY_CH || (int)n.note != pitch) continue;
+    int ss = nearestStep16(n.start);
+    int span = (int)((n.dur + PPQ / 4 - 1) / (PPQ / 4));
+    if (span < 1) span = 1;
+    if (absStep >= ss && absStep < ss + span) return (int)i;
+  }
+  return -1;
+}
+
+// グリッドのセルを押した瞬間: まだ置く/消すはしない。対象の音があれば覚える。
+static void gridPressBegin(int pitch, int absStep, int id) {
+  finalizeActiveKeys();  // 削除で録音中ノートの参照がずれるのを防ぐ
+  g_gridPendId = id;
+  g_gridPendPitch = pitch;
+  g_gridPendStep = absStep;
+  g_gridPendIdx = findMelNoteAt(pitch, absStep);
+  g_gridStretching = false;
+}
+
+// 指のある絶対ステップに合わせて対象音の長さを変える (16分単位)。
+static void gridStretchTo(int absStep) {
+  if (g_gridPendIdx < 0 || g_gridPendIdx >= (int)g_song.size()) return;
+  Note& n = g_song[g_gridPendIdx];
+  int ss = nearestStep16(n.start);
+  int newSteps = absStep - ss + 1;  // 開始セルを含めた長さ
+  if (newSteps < 1) newSteps = 1;
+  if (ss + newSteps > 64) newSteps = 64 - ss;  // ループの終わりまで
+  // 同じ音高の次の音に重ならないよう、そこで止める
+  for (const Note& m : g_song) {
+    if (m.ch != MELODY_CH || (int)m.note != (int)n.note) continue;
+    int ms = nearestStep16(m.start);
+    if (ms > ss && ms < ss + newSteps) newSteps = ms - ss;
+  }
+  if (newSteps < 1) newSteps = 1;
+  uint32_t nd = (uint32_t)newSteps * (PPQ / 4);
+  if (nd == n.dur) return;
+  n.dur = nd;
+  g_gridStretching = true;
+  drawMelGridRows();
+}
+
+// 毎フレーム呼ぶ: 保留中の指が横へ動けば伸ばし、離れればタップ/確定する。
+static void handleMelGridDrag(void) {
+  if (g_gridPendId < 0) return;
+  int cnt = (int)M5.Touch.getCount();
+  bool found = false, released = false;
+  int curAbs = -1;
+  for (int i = 0; i < cnt; ++i) {
+    auto d = M5.Touch.getDetail(i);
+    if ((int)d.id != g_gridPendId) continue;
+    found = true;
+    if (d.wasReleased()) released = true;
+    if (d.isPressed() || d.wasPressed()) {
+      int col = ((int)d.x - GRID_CELL_X) / GRID_CELL_STEP;
+      int row = ((int)d.y - GRID_Y) / GRID_ROW_H;
+      if (col >= 0 && col < 16 && row >= 0 && row < 12 &&
+          ((int)d.x - GRID_CELL_X) % GRID_CELL_STEP < GRID_CELL_W) {
+        curAbs = g_gridBar * 16 + col;  // 音高は押した行に固定し、列だけ見る
+      }
+    }
+    break;
+  }
+  if (!found || released) {
+    // 指が離れた (wasReleased を取りこぼして一覧から消えた場合もここ)。
+    bool stretched = g_gridStretching;
+    int idx = g_gridPendIdx;
+    int pitch = g_gridPendPitch, step = g_gridPendStep;
+    g_gridPendId = -1;
+    g_gridStretching = false;
+    if (!stretched) {
+      toggleMelStep(pitch, step);  // 従来通りの置く/消す
+      drawMelGridRows();
+      drawFooter();
+    } else if (idx >= 0 && idx < (int)g_song.size()) {
+      int steps = (int)(g_song[idx].dur / (PPQ / 4));
+      g_msg = "音の長さ: " + String(steps) + "ステップにしました";
+      synth.setNoteOn(MELODY_CH, g_song[idx].note, 110);  // 伸ばした音を試聴
+      g_audNote = g_song[idx].note;
+      g_audOffAt = millis() + 200;
+      drawMelGridRows();
+      drawFooter();
+    }
+    return;
+  }
+  if (curAbs >= 0 && curAbs != g_gridPendStep && g_gridPendIdx >= 0) {
+    gridStretchTo(curAbs);
   }
 }
 
@@ -763,7 +1026,7 @@ static void keyOn(int note, int id) {
   slot->active = true;
   synth.setNoteOn(MELODY_CH, (uint8_t)note, 110);
   if (g_running && g_recording) {
-    uint32_t start = absNowTick() % LOOP_TICKS;
+    uint32_t start = absNowTick() % loopTicks();
     g_song.push_back({start, 0, MELODY_CH, (uint8_t)note, 110});
     slot->songIdx = (int)g_song.size() - 1;
   }
@@ -778,7 +1041,7 @@ static void keyOffById(int id) {
     if (k.songIdx >= 0 && k.songIdx < (int)g_song.size()) {
       Note& n = g_song[k.songIdx];
       uint32_t d = absNowTick() - k.absStart;
-      uint32_t maxDur = LOOP_TICKS - n.start;
+      uint32_t maxDur = loopTicks() - n.start;
       if (d > maxDur) d = maxDur;
       n.dur = d ? d : 30;
     }
@@ -909,15 +1172,16 @@ struct ParamDef {
   int* val;
   int minv, maxv, step;
 };
-static ParamDef PARAMS[6] = {
+static ParamDef PARAMS[7] = {
   {"TEMPO (BPM)",     &g_bpm,          60, 200, 2},
   {"MASTER VOLUME %", &g_masterVolPct, 10, 200, 5},
   {"MELODY VOLUME %", &g_melVolPct,     0, 200, 5},
   {"DRUM VOLUME %",   &g_drumVolPct,    0, 200, 5},
   {"NOTE LENGTH %",   &g_gatePct,      10, 200, 5},
   {"EXPORT LOOPS",    &g_repeats,       1,   8, 1},
+  {"LOOP BARS",       &g_loopBars,      4,  16, 4},
 };
-static const int ROW_Y0 = 200, ROW_H = 68;
+static const int ROW_Y0 = 200, ROW_H = 62;
 
 static void drawEditRow(int i) {
   const ParamDef& p = PARAMS[i];
@@ -925,24 +1189,24 @@ static void drawEditRow(int i) {
   M5.Display.fillRect(0, y, 1280, ROW_H, TFT_BLACK);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.setTextSize(3);
-  M5.Display.setCursor(20, y + 20);
+  M5.Display.setCursor(20, y + 17);
   M5.Display.print(p.label);
   // - / + ボタンと値
-  M5.Display.fillRect(440, y + 6, 90, 56, TFT_DARKGREY);
-  M5.Display.drawRect(440, y + 6, 90, 56, TFT_WHITE);
-  M5.Display.fillRect(790, y + 6, 90, 56, TFT_DARKGREY);
-  M5.Display.drawRect(790, y + 6, 90, 56, TFT_WHITE);
+  M5.Display.fillRect(440, y + 5, 90, 52, TFT_DARKGREY);
+  M5.Display.drawRect(440, y + 5, 90, 52, TFT_WHITE);
+  M5.Display.fillRect(790, y + 5, 90, 52, TFT_DARKGREY);
+  M5.Display.drawRect(790, y + 5, 90, 52, TFT_WHITE);
   M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
   M5.Display.setTextSize(4);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString("-", 485, y + 34);
-  M5.Display.drawString("+", 835, y + 34);
+  M5.Display.drawString("-", 485, y + 31);
+  M5.Display.drawString("+", 835, y + 31);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.drawString(String(*p.val), 660, y + 34);
+  M5.Display.drawString(String(*p.val), 660, y + 31);
   // バー
-  M5.Display.drawRect(920, y + 14, 320, 40, TFT_WHITE);
+  M5.Display.drawRect(920, y + 11, 320, 40, TFT_WHITE);
   int fw = 316 * (*p.val - p.minv) / (p.maxv - p.minv);
-  if (fw > 0) M5.Display.fillRect(922, y + 16, fw, 36, TFT_BLUE);
+  if (fw > 0) M5.Display.fillRect(922, y + 13, fw, 36, TFT_BLUE);
   M5.Display.setTextDatum(top_left);
 }
 
@@ -958,8 +1222,13 @@ static void drawEdit(void) {
   M5.Display.setTextSize(2);
   M5.Display.setTextDatum(middle_center);
   M5.Display.drawString("RESET PARAMS", 1120, 172);
+  M5.Display.fillRect(720, 152, 260, 40, TFT_DARKGREY);
+  M5.Display.drawRect(720, 152, 260, 40, TFT_WHITE);
+  M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString("LOAD MIDI (SD)", 850, 172);
   M5.Display.setTextDatum(top_left);
-  for (int i = 0; i < 6; ++i) drawEditRow(i);
+  for (int i = 0; i < 7; ++i) drawEditRow(i);
 }
 
 static void resetParams(void) {
@@ -969,6 +1238,7 @@ static void resetParams(void) {
   g_drumVolPct = 100;
   g_gatePct = 100;
   g_repeats = 4;
+  g_loopBars = 4;
 }
 
 static void adjustParam(int i, int dir) {
@@ -983,6 +1253,16 @@ static void adjustParam(int i, int dir) {
     stopTransport();
     startTransport(false);
     drawTransport();
+  }
+  if (i == 6) {
+    // ループ小節数: グリッド表示小節を範囲内に収め、再生中は頭から再生し直す
+    if (g_gridBar >= g_loopBars) g_gridBar = g_loopBars - 1;
+    if (g_running) {
+      bool wasRec = g_recording;
+      stopTransport();
+      startTransport(wasRec);
+      drawTransport();
+    }
   }
   g_msg = String(p.label) + " = " + String(nv);
   drawEditRow(i);
@@ -1015,7 +1295,7 @@ static void hitDrum(int i) {
   g_selDrum = i;
   synth.setNoteOn(DRUM_CH, DRUM_NOTES[i], 110);
   if (g_running && g_recording) {
-    uint32_t pos = posTickRaw() % LOOP_TICKS;
+    uint32_t pos = posTickRaw() % loopTicks();
     g_song.push_back({pos, 30, DRUM_CH, DRUM_NOTES[i], 110});
   }
 }
@@ -1065,7 +1345,7 @@ void setup(void) {
   drawAll();
 
   synth.begin(&Serial2, UNIT_SYNTH_BAUD, SYNTH_RX_PIN, SYNTH_TX_PIN);
-  Serial.println("tab5_synth ready");
+  Serial.println("Phase 8 ready");
 }
 
 void loop(void) {
@@ -1074,12 +1354,12 @@ void loop(void) {
   // ----- ループ再生スケジューラ (周回処理つき) -----
   if (g_running) {
     uint32_t pos = posTickRaw();
-    if (pos >= LOOP_TICKS) {  // 周回: 残りを流してから次の周へ
+    if (pos >= loopTicks()) {  // 周回: 残りを流してから次の周へ
       while (g_streamIdx < g_stream.size()) {
         const RawEv& e = g_stream[g_streamIdx++];
         sendMidi(e.status, e.d1, e.d2);
       }
-      g_loopStartMs += tickToMs(LOOP_TICKS);
+      g_loopStartMs += tickToMs(loopTicks());
       g_passCount++;
       buildStream();
       g_nextClickTick = 0;
@@ -1119,7 +1399,7 @@ void loop(void) {
             break;
           case 4: {
             int r = exportMidiFile();
-            g_msg = (r >= 0) ? ("書き出し完了 /tab5song.mid (" + String(r) + " bytes, loop x" +
+            g_msg = (r >= 0) ? ("書き出し完了 " + g_exportName + " (" + String(r) + " bytes, loop x" +
                                 String(g_repeats) + ", SD:" + g_sdMode + ")")
                              : "SD書き出し失敗";
             break;
@@ -1140,9 +1420,10 @@ void loop(void) {
           }
         }
       } else if (ty >= 416 && ty < 464) {  // グリッドヘッダ
-        if (tx >= 330 && tx < 634) {
-          int b = (tx - 330) / 76;
-          if (b >= 0 && b < 4 && (tx - 330) % 76 < 66) { g_gridBar = b; drawGridHeader(); drawSteps(true); }
+        if (tx >= 330 && tx < 386) {
+          if (g_gridBar > 0) { g_gridBar--; drawGridHeader(); drawSteps(true); }
+        } else if (tx >= 556 && tx < 612) {
+          if (g_gridBar < g_loopBars - 1) { g_gridBar++; drawGridHeader(); drawSteps(true); }
         } else if (tx >= 660 && tx < 840) {
           undoLastDrum(); g_msg = "最後のドラム音を取り消しました"; drawSteps(true); drawFooter();
         } else if (tx >= 856 && tx < 1240) {
@@ -1164,9 +1445,10 @@ void loop(void) {
         else if (tx >= 1020 && tx < 1240) { clearMelody(); g_msg = "メロディを全て消しました"; drawFooter(); }
       } else if (g_melView == 2) {  // グリッド編集
         if (ty >= GRID_HDR_Y && ty < GRID_HDR_Y + 44) {
-          if (tx >= GRID_CELL_X && tx < GRID_CELL_X + 4 * 68) {
-            int b = (tx - GRID_CELL_X) / 68;
-            if ((tx - GRID_CELL_X) % 68 < 60) { g_gridBar = b; drawMelGridHeader(); drawMelGridRows(); }
+          if (tx >= GRID_CELL_X && tx < GRID_CELL_X + 48) {
+            if (g_gridBar > 0) { g_gridBar--; drawMelGridHeader(); drawMelGridRows(); }
+          } else if (tx >= GRID_CELL_X + 196 && tx < GRID_CELL_X + 244) {
+            if (g_gridBar < g_loopBars - 1) { g_gridBar++; drawMelGridHeader(); drawMelGridRows(); }
           } else if (tx >= 420 && tx < 590) {
             g_gridLenIdx = (g_gridLenIdx + 1) % 4;
             g_msg = "置く音の長さ: " + String(GRID_LEN_NAMES[g_gridLenIdx]);
@@ -1185,8 +1467,9 @@ void loop(void) {
           int row = (ty - GRID_Y) / GRID_ROW_H;
           if (col >= 0 && col < 16 && (tx - GRID_CELL_X) % GRID_CELL_STEP < GRID_CELL_W &&
               row >= 0 && row < 12) {
-            toggleMelStep(g_gridTop - row, g_gridBar * 16 + col);
-            drawMelGridRows(); drawFooter();
+            // タップかドラッグ(伸ばし)かは離すまで分からないので、ここでは
+            // 保留だけして、handleMelGridDrag() が毎フレーム判定する。
+            gridPressBegin(g_gridTop - row, g_gridBar * 16 + col, (int)touch.id);
           }
         }
       } else if (g_melView == 1) {  // 音色リスト
@@ -1217,11 +1500,28 @@ void loop(void) {
         }
       }
     } else if (g_mode == MODE_EDIT) {
-      if (ty >= 152 && ty < 192 && tx >= 1000 && tx < 1240) {  // RESET PARAMS
+      if (ty >= 152 && ty < 192 && tx >= 720 && tx < 980) {  // LOAD MIDI (SD)
+        String path;
+        int pr = pickLoadFile(path);
+        if (pr == -1) g_msg = "LOAD失敗: SDカードが読めません";
+        else if (pr == -2) g_msg = "LOAD失敗: tab5song*.mid がありません";
+        else {
+          int r = loadMidiFile(path.c_str());
+          if (r == 0) {
+            int dm = 0, mm = 0;
+            for (const Note& n : g_song) (n.ch == DRUM_CH ? dm : mm)++;
+            g_msg = path + " を読み込み: メロディ " + String(mm) + " / ドラム " + String(dm) +
+                    " (先頭1ループ分) もう一度押すと次のファイル";
+          }
+          else if (r == -4) g_msg = "LOAD失敗: 音が見つかりませんでした";
+          else g_msg = "LOAD失敗: MIDIファイルの形式エラー";
+        }
+        drawEdit(); drawFooter();
+      } else if (ty >= 152 && ty < 192 && tx >= 1000 && tx < 1240) {  // RESET PARAMS
         resetParams();
         g_msg = "パラメータを初期値に戻しました";
         drawEdit(); drawFooter();
-      } else if (ty >= ROW_Y0 && ty < ROW_Y0 + 6 * ROW_H) {
+      } else if (ty >= ROW_Y0 && ty < ROW_Y0 + 7 * ROW_H) {
         int row = (ty - ROW_Y0) / ROW_H;
         if (tx >= 440 && tx < 530) adjustParam(row, -1);
         else if (tx >= 790 && tx < 880) adjustParam(row, +1);
@@ -1237,6 +1537,8 @@ void loop(void) {
 
   // メロディ鍵盤のマルチタッチ処理 (毎フレーム)
   if (g_mode == MODE_MELODY && g_melView == 0) handleMelodyPoints();
+  // メロディグリッドの伸ばし処理 (毎フレーム)
+  if (g_mode == MODE_MELODY && g_melView == 2) handleMelGridDrag();
 
   // 再生中のステップハイライト更新
   if (g_running && g_mode == MODE_RHYTHM) drawSteps(false);
